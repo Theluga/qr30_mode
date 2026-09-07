@@ -1,0 +1,185 @@
+#!/bin/bash
+#set -x
+
+# Find hidraw device for QR30 using your logic
+find_qr30_hidraw() {
+    for dev in /dev/hidraw*; do
+        [[ ! -e "$dev" ]] && continue
+        udev=$(udevadm info -q property -n "$dev")
+        VID=$(echo "$udev" | grep ^ID_VENDOR_ID= | cut -d= -f2 | tr -d '[:space:]')
+        PID=$(echo "$udev" | grep ^ID_MODEL_ID= | cut -d= -f2 | tr -d '[:space:]')
+        IFACE=$(echo "$udev" | grep ^ID_USB_INTERFACE_NUM= | cut -d= -f2 | tr -d '[:space:]')
+
+        if [[ "$VID" == "2d99" && "$PID" == "a101" && "$IFACE" == "03" ]]; then
+            echo "$dev"
+            return
+        fi
+    done
+    echo "QR30 device not found" >&2
+    exit 1
+}
+
+# Save all set-volume payloads as-is (0 = mute, 16 = max)
+declare -A SET_VOLUME_PAYLOADS=(
+    [0]="2eaaec67000100fe00000000000000000000000000000000000000000000000000"
+    [1]="2eaaec67000101ff00000000000000000000000000000000000000000000000000"
+    [2]="2eaaec670001020000000000000000000000000000000000000000000000000000"
+    [3]="2eaaec670001030100000000000000000000000000000000000000000000000000"
+    [4]="2eaaec670001040200000000000000000000000000000000000000000000000000"
+    [5]="2eaaec670001050300000000000000000000000000000000000000000000000000"
+    [6]="2eaaec670001060400000000000000000000000000000000000000000000000000"
+    [7]="2eaaec670001070500000000000000000000000000000000000000000000000000"
+    [8]="2eaaec670001080600000000000000000000000000000000000000000000000000"
+    [9]="2eaaec670001090700000000000000000000000000000000000000000000000000"
+    [10]="2eaaec6700010a0800000000000000000000000000000000000000000000000000"
+    [11]="2eaaec6700010b0900000000000000000000000000000000000000000000000000"
+    [12]="2eaaec6700010c0a00000000000000000000000000000000000000000000000000"
+    [13]="2eaaec6700010d0b00000000000000000000000000000000000000000000000000"
+    [14]="2eaaec6700010e0c00000000000000000000000000000000000000000000000000"
+    [15]="2eaaec6700010f0d00000000000000000000000000000000000000000000000000"
+    [16]="2eaaec670001100e00000000000000000000000000000000000000000000000000"
+)
+
+# Volume query payload
+VOLUME_QUERY="2eaaec660000fc00000000000000000000000000000000000000000000000000"
+
+declare -A GET_VOLUME_PAYLOADS=(
+  [0]="2fbbec66000210001f0000000000000000000000000000000000000000000000"
+  [1]="2fbbec6600021001200000000000000000000000000000000000000000000000"
+  [2]="2fbbec6600021002210000000000000000000000000000000000000000000000"
+  [3]="2fbbec6600021003220000000000000000000000000000000000000000000000"
+  [4]="2fbbec6600021004230000000000000000000000000000000000000000000000"
+  [5]="2fbbec6600021005240000000000000000000000000000000000000000000000"
+  [6]="2fbbec6600021006250000000000000000000000000000000000000000000000"
+  [7]="2fbbec6600021007260000000000000000000000000000000000000000000000"
+  [8]="2fbbec6600021008270000000000000000000000000000000000000000000000"
+  [9]="2fbbec6600021009280000000000000000000000000000000000000000000000"
+  [10]="2fbbec660002100a290000000000000000000000000000000000000000000000"
+  [11]="2fbbec660002100b2a0000000000000000000000000000000000000000000000"
+  [12]="2fbbec660002100c2b0000000000000000000000000000000000000000000000"
+  [13]="2fbbec660002100d2c0000000000000000000000000000000000000000000000"
+  [14]="2fbbec660002100e2d0000000000000000000000000000000000000000000000"
+  [15]="2fbbec660002100f2e0000000000000000000000000000000000000000000000"
+  [16]="2fbbec66000210102f0000000000000000000000000000000000000000000000"
+)
+
+# Send hex payload to device
+send_hex() {
+    local payload="$1"
+    local dev="$2"
+    echo "$payload" | xxd -r -p | dd bs=64 count=1 of="$dev" conv=sync 2>/dev/null
+}
+
+query_volume() {
+    local dev="$1"
+    local tmpfile="/tmp/volume-query"
+    local timeout=2
+    local query="$VOLUME_QUERY"
+
+    rm -f "$tmpfile"
+
+    # Start reader BEFORE sending the query.
+    timeout "$timeout" dd if="$dev" bs=64 count=1 iflag=fullblock 2>/dev/null | xxd -p -l 32 -c 32 > "$tmpfile" &
+    local reader_pid=$!
+
+    # Now send the query
+    echo "$query" | xxd -r -p | dd of="$dev" bs=64 count=1 conv=sync status=none 2>/dev/null
+
+    # Wait for the reader to produce something, up to $timeout seconds.
+    local elapsed=0
+    local interval_ms=100    # 100ms = 0.1 seconds
+    local timeout_ms=$(( timeout * 1000 ))
+
+    while (( elapsed < timeout_ms )); do
+        if [[ -s "$tmpfile" ]]; then
+            break
+        fi
+        if ! kill -0 "$reader_pid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+        elapsed=$(( elapsed + interval_ms ))
+    done
+
+    if kill -0 "$reader_pid" 2>/dev/null; then
+        kill "$reader_pid" 2>/dev/null || true
+    fi
+
+    local resp=""
+    if [[ -s "$tmpfile" ]]; then
+        resp=$(tr -d '[:space:]' < "$tmpfile")
+        #echo "$$resp"
+    fi
+
+    if [[ -z "$resp" ]]; then
+        echo "-1"
+        return
+    fi
+
+    local pref="${resp:0:32}"
+    for vol in "${!GET_VOLUME_PAYLOADS[@]}"; do
+        if [[ "${GET_VOLUME_PAYLOADS[$vol]:0:32}" == "$pref" ]]; then
+            echo "$vol"
+            return "$vol"
+        fi
+    done
+
+    echo "-1"
+}
+
+
+# Decode response into volume
+decode_volume() {
+    local resp="$1"
+    for vol in "${!GET_VOLUME_PAYLOADS[@]}"; do
+        if [[ "${GET_VOLUME_PAYLOADS[$vol]}" == "$resp" ]]; then
+            echo "$vol"
+            return
+        fi
+    done
+    echo "-1"
+}
+
+# Main logic
+main() {
+    local opt="$1"
+    local val="$2"
+
+    HIDRAW_DEV=$(find_qr30_hidraw)
+
+    case "$opt" in
+        -v)
+            if [[ "$val" == "g" ]]; then
+                # Start listener, then send query
+                #resp=$(read_response_with_timeout "$HIDRAW_DEV") &
+                #send_hex "$VOLUME_QUERY" "$HIDRAW_DEV"
+                
+                # Wait for listener to complete
+                #wait
+
+                # Decode and show result
+                #vol=$(decode_volume "$resp")
+                
+                vol=$(query_volume "$HIDRAW_DEV")
+                
+                if [[ "$vol" -ge 0 ]]; then
+                    echo "Current volume: $vol"
+                else
+                    echo "Unknown or no response: $resp"
+                fi
+            elif [[ "$val" =~ ^[0-9]+$ ]] && [[ ${SET_VOLUME_PAYLOADS[$val]+_} ]]; then
+                send_hex "${SET_VOLUME_PAYLOADS[$val]}" "$HIDRAW_DEV"
+                echo "Set volume to $val"
+            else
+                echo "Usage: $0 -v <0-16> | -v g"
+                exit 1
+            fi
+            ;;
+        *)
+            echo "Usage: $0 -v <0-16> | -v g"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
